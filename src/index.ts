@@ -2,13 +2,8 @@
 import { Command } from "commander";
 import fs from "fs";
 import path from "path";
-import { promisify } from "util";
 import { version } from "../package.json";
-
-const readdir = promisify(fs.readdir);
-const mkdir = promisify(fs.mkdir);
-const rename = promisify(fs.rename);
-const stat = promisify(fs.stat);
+import os from "os";
 
 type Options = {
   ext: boolean;
@@ -26,13 +21,31 @@ const FILE_TYPE_MAP: Record<string, string> = {
   ".pdf": "documents-pdf",
 };
 
+class FilePathResolver {
+  private existingFiles = new Set<string>();
+
+  async getUniquePath(basePath: string, fileName: string): Promise<string> {
+    let newPath = path.join(basePath, fileName);
+    let counter = 1;
+
+    while (this.existingFiles.has(newPath)) {
+      const { name, ext } = path.parse(fileName);
+      newPath = path.join(basePath, `${name}(${counter})${ext}`);
+      counter++;
+    }
+
+    this.existingFiles.add(newPath);
+    return newPath;
+  }
+}
+
 const program = new Command();
 
 program
   .version(version)
-  .argument("[directory]", "Directory to tidy up", ".") // Default to current directory
+  .argument("[directory]", "Directory to tidy up", ".")
   .description("Organize files in a directory based on their extensions")
-  .option("--ext", "Use the file extetions as folder names")
+  .option("--ext", "Use the file extensions as folder names")
   .option("--name", "Group files by starting name")
   .option("--ignore-dotfiles", "Ignore dotfiles")
   .action(async (inputDir: string, options: Options) => {
@@ -43,7 +56,7 @@ program
         process.exit(1);
       }
 
-      const dirStat = await stat(dirPath);
+      const dirStat = await fs.promises.stat(dirPath);
       if (!dirStat.isDirectory()) {
         console.error(`The provided path is not a directory: ${dirPath}`);
         process.exit(1);
@@ -72,127 +85,167 @@ function isDotFile(fileName: string): boolean {
  * @param dirPath - The path to the directory.
  * @returns A record where keys are file extensions and values are file paths.
  */
-async function getFileTypes(
+async function getFileGroups(
   dirPath: string,
   options: Options
 ): Promise<Record<string, string[]>> {
-  const files = await readdir(dirPath);
-  const fileTypes: Record<string, string[]> = {};
+  const groups: Record<string, string[]> = {};
+  const entries = await fs.promises.readdir(dirPath, { withFileTypes: true });
 
-  for (const file of files) {
-    if (options.ignoreDotfiles && isDotFile(file)) {
-      continue;
-    }
+  for (const entry of entries) {
+    if (!entry.isFile()) continue;
+    if (options.ignoreDotfiles && isDotFile(entry.name)) continue;
 
-    const filePath = path.join(dirPath, file);
-    const fileStat = await stat(filePath);
+    const filePath = path.join(dirPath, entry.name);
+    const key = options.name
+      ? path.parse(entry.name).name.slice(0, 10)
+      : path.extname(entry.name).toLowerCase();
 
-    if (fileStat.isFile()) {
-      const ext = path.extname(file).toLowerCase();
-      if (!fileTypes[ext]) {
-        fileTypes[ext] = [];
-      }
-      fileTypes[ext].push(filePath);
-    }
+    groups[key] = groups[key] || [];
+    groups[key].push(filePath);
   }
 
-  return fileTypes;
+  return groups;
 }
 
 /**
- * Get all file name groups based on starting names.
- * @param dirPath - The path to the directory.
- * @returns A record where keys are base names and values are file paths.
+ * Ensures that all necessary folders exist for organizing files based on their
+ * extensions or names. Creates folders if they do not exist and maps each group
+ * key to its corresponding folder path.
+ *
+ * @param groups - A record where keys are file extensions or names, and values
+ * are arrays of file paths belonging to those groups.
+ * @param dirPath - The base directory path where folders will be created.
+ * @param options - Options to determine whether to group by extension or name,
+ * and to ignore dotfiles.
+ * @returns A map where keys are group identifiers and values are paths to the
+ * corresponding folders.
  */
-async function getFileNameGroups(
+async function ensureFolders(
+  groups: Record<string, string[]>,
   dirPath: string,
   options: Options
-): Promise<Record<string, string[]>> {
-  const files = await readdir(dirPath);
-  const nameGroups: Record<string, string[]> = {};
+): Promise<Map<string, string>> {
+  const folderMap = new Map<string, string>();
 
-  for (const file of files) {
-    if (options.ignoreDotfiles && isDotFile(file)) {
-      continue;
+  for (const key of Object.keys(groups)) {
+    const folderName = options.ext
+      ? key.replace(".", "")
+      : FILE_TYPE_MAP[key] || `others-${key.replace(".", "")}`;
+
+    const folderPath = path.join(dirPath, folderName);
+    try {
+      await fs.promises.mkdir(folderPath, { recursive: true });
+    } catch (e) {
+      // Folder might already exist, ignore error
     }
-
-    const filePath = path.join(dirPath, file);
-    const fileStat = await stat(filePath);
-
-    if (fileStat.isFile()) {
-      const baseName = path.parse(file).name.slice(0, 10);
-      if (!nameGroups[baseName]) {
-        nameGroups[baseName] = [];
-      }
-      nameGroups[baseName].push(filePath);
-    }
+    folderMap.set(key, folderPath);
   }
 
-  return nameGroups;
+  return folderMap;
+}
+
+/**
+ * Moves files to a target directory in chunks to prevent overwhelming the system.
+ *
+ * @param files - An array of file paths that need to be moved.
+ * @param targetDir - The directory where the files should be moved to.
+ * @param resolver - A utility to resolve and ensure unique file paths in the target directory.
+ * @returns A promise that resolves to the number of files successfully moved.
+ */
+async function moveFilesInChunks(
+  files: string[],
+  targetDir: string,
+  resolver: FilePathResolver
+): Promise<number> {
+  const chunkSize = 100;
+  let processed = 0;
+
+  for (let i = 0; i < files.length; i += chunkSize) {
+    const chunk = files.slice(i, i + chunkSize);
+    await Promise.all(
+      chunk.map(async (filePath) => {
+        const fileName = path.basename(filePath);
+        const newPath = await resolver.getUniquePath(targetDir, fileName);
+        await fs.promises.rename(filePath, newPath);
+        processed++;
+      })
+    );
+  }
+
+  return processed;
+}
+
+/**
+ * Processes file groups in parallel by dividing the work into chunks and
+ * running each chunk in a separate CPU core. The number of chunks is
+ * determined by the number of CPUs available on the system.
+ *
+ * @param groups - A record where keys are file extensions or names, and values
+ * are arrays of file paths.
+ * @param folderMap - A map where keys are group identifiers and values are paths
+ * to the corresponding folders.
+ * @returns A promise that resolves to a record where keys are group identifiers
+ * and values are the number of files successfully moved.
+ */
+async function processInParallel(
+  groups: Record<string, string[]>,
+  folderMap: Map<string, string>
+): Promise<Record<string, number>> {
+  const results: Record<string, number> = {};
+  const resolver = new FilePathResolver();
+  const cpus = os.cpus().length;
+
+  // Create chunks of work
+  const entries = Object.entries(groups);
+  const chunkSize = Math.max(1, Math.ceil(entries.length / cpus));
+  const chunks = Array.from(
+    { length: Math.ceil(entries.length / chunkSize) },
+    (_, i) => entries.slice(i * chunkSize, (i + 1) * chunkSize)
+  );
+
+  await Promise.all(
+    chunks.map(async (chunk) => {
+      for (const [key, files] of chunk) {
+        const targetDir = folderMap.get(key)!;
+        results[key] = await moveFilesInChunks(files, targetDir, resolver);
+      }
+    })
+  );
+
+  return results;
 }
 
 /**
  * Organize files into folders based on their extensions and provide detailed output.
  * @param dirPath - The directory path to organize.
  */
+async function organizeFiles(dirPath: string, options: Options): Promise<void> {
+  console.time("Organization completed in");
 
-async function organizeFiles(
-  dirPath: string,
-  options: Options
-): Promise<void> {
-  let fileTypes: Record<string, string[]>;
+  // Get all files grouped by extension or name
+  const groups = await getFileGroups(dirPath, options);
 
-  if (options.name) {
-    fileTypes = await getFileNameGroups(dirPath, options);
-  } else {
-    fileTypes = await getFileTypes(dirPath, options);
-  }
+  // Ensure all necessary folders exist
+  const folderMap = await ensureFolders(groups, dirPath, options);
 
-  const summary: { folder: string; created: boolean; filesAdded: number }[] =
-    [];
+  // Process files in parallel
+  const results = await processInParallel(groups, folderMap);
 
-  for (const [ext, filePaths] of Object.entries(fileTypes)) {
-    const newFolder = ext.split(".")[1];
-
-    const folderName = options.ext
-      ? newFolder
-      : FILE_TYPE_MAP[ext] || `others-${ext.replace(".", "")}`;
-    const folderPath = path.join(dirPath, folderName);
-    let folderCreated = false;
-
-    if (!fs.existsSync(folderPath)) {
-      await mkdir(folderPath);
-      folderCreated = true;
-    }
-
-    let filesAdded = 0;
-    for (const filePath of filePaths) {
-      const fileName = path.basename(filePath);
-      let newFilePath = path.join(folderPath, fileName);
-      // Check if file already exists and resolve conflicts
-      if (fs.existsSync(newFilePath)) {
-        const fileBase = path.parse(fileName).name;
-        const fileExt = path.extname(fileName);
-        let counter = 1;
-        while (fs.existsSync(newFilePath)) {
-          const newFileName = `${fileBase}(${counter})${fileExt}`;
-          newFilePath = path.join(folderPath, newFileName);
-          counter++;
-        }
-      }
-      await rename(filePath, newFilePath);
-      filesAdded++;
-    }
-    summary.push({ folder: folderName, created: folderCreated, filesAdded });
-  }
-
-  const lastPath = dirPath.split("/");
+  // Generate summary
+  const lastPath = dirPath.split(path.sep);
   const lastDir = lastPath[lastPath.length - 1];
 
-  console.log(`Organization Summary for '${lastDir}':`);
-  for (const { folder, created, filesAdded } of summary) {
-    console.log(`- Folder: ${folder}`);
-    console.log(`  - ${created ? "Created" : "Already existed"}`);
-    console.log(`  - Files added: ${filesAdded}`);
+  console.log(`\nOrganization Summary for '${lastDir}':`);
+  for (const key of Object.keys(results)) {
+    const folderPath = folderMap.get(key);
+    if (!folderPath) {
+      console.error(`Error: No folder path found for key: ${key}`);
+      continue;
+    }
+    const folderName = folderPath.split(path.sep).pop()!;
+    console.log(`- Folder: ${folderName}`);
+    console.log(`  - Files moved: ${results[key]}`);
   }
+  console.timeEnd("Organization completed in"); // Outputs `Organization completed in: xxx ms`. This is optional and could be removed.
 }
