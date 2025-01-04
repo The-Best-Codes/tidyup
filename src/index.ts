@@ -1,4 +1,6 @@
 #!/usr/bin/env node
+
+// NOTE: This is a work in progress
 import { Command } from "commander";
 import fs from "fs";
 import path from "path";
